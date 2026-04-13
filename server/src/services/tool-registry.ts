@@ -399,11 +399,14 @@ export class ToolRegistry {
         return result;
       }
 
-      // Agent self-management tools (personality, role, instructions)
-      const agentTools = ["update_instructions", "update_personality", "update_role"];
-      if (agentTools.includes(name)) {
+      // Agent management tools (self + staff management for Chief of Staff)
+      const agentToolNames = [
+        "update_instructions", "update_personality", "update_role",
+        "list_agents", "create_agent", "delete_agent", "pause_agent", "resume_agent", "update_agent_assignment",
+      ];
+      if (agentToolNames.includes(name)) {
         const result = await handleAgentTool(
-          { db: ctx.db, agentId: ctx.agentId, memberId: ctx.memberId, memberName: ctx.memberName, householdId: ctx.householdId },
+          { db: ctx.db, agentId: ctx.agentId, memberId: ctx.memberId, memberName: ctx.memberName, householdId: ctx.householdId, isChiefOfStaff: ctx.isChiefOfStaff },
           name,
           input,
         );
