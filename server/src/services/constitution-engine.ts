@@ -41,8 +41,8 @@ import {
   scanResponse,
   type EvaluationResult,
 } from "./evaluators.js";
-import { compileSystemPrompt, buildDelegationInstructions } from "./prompt-compiler.js";
-import { delegationEdges, activityLog } from "@carsonos/db";
+import { compileSystemPrompt } from "./prompt-compiler.js";
+import { activityLog } from "@carsonos/db";
 import {
   buildMemorySchemaInstructions,
   DEFAULT_MEMORY_SCHEMA,
@@ -300,24 +300,9 @@ export class ConstitutionEngine {
       agentId,
     );
 
-    // Load delegation instructions for personal agents
-    let delegationInstr: string | null = null;
-    if (agent.staffRole === "personal") {
-      const edges = await this.db
-        .select({
-          agentId: staffAgents.id,
-          agentName: staffAgents.name,
-          staffRole: staffAgents.staffRole,
-          specialty: staffAgents.specialty,
-        })
-        .from(delegationEdges)
-        .innerJoin(staffAgents, eq(staffAgents.id, delegationEdges.toAgentId))
-        .where(eq(delegationEdges.fromAgentId, agentId));
-
-      if (edges.length > 0) {
-        delegationInstr = buildDelegationInstructions(edges);
-      }
-    }
+    // Delegation is not active in v0.1 — will be enabled in a future version.
+    // When re-enabled, filter delegation targets by status === "active".
+    const delegationInstr: string | null = null;
 
     // -- 5. Load conversation history + session state -----------------
     const conversationId = await this.getOrCreateConversation(
