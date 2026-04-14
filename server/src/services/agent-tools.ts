@@ -274,11 +274,23 @@ async function handleCreateAgent(ctx: AgentToolContext, input: Record<string, un
   const assignToMember = input.assign_to_member as string;
   const trustLevel = (input.trust_level as string) ?? "restricted";
 
-  // Fix #6: validate required fields
+  // Validate required fields
   if (!name) return { content: "Agent name cannot be empty.", is_error: true };
   if (!roleContent) return { content: "Role description cannot be empty.", is_error: true };
 
-  // Fix #4: check for duplicate name
+  // Validate staff_role — block head_butler (only one Chief of Staff allowed)
+  const allowedRoles = ["personal", "tutor", "coach", "scheduler", "custom"];
+  if (!allowedRoles.includes(staffRole)) {
+    return { content: `Invalid role "${staffRole}". Must be one of: ${allowedRoles.join(", ")}`, is_error: true };
+  }
+
+  // Validate trust_level
+  const allowedTrust = ["full", "standard", "restricted"];
+  if (!allowedTrust.includes(trustLevel)) {
+    return { content: `Invalid trust level "${trustLevel}". Must be one of: ${allowedTrust.join(", ")}`, is_error: true };
+  }
+
+  // Check for duplicate name
   const existing = findAgent(ctx, name);
   if (existing) return { content: `An agent named "${name}" already exists.`, is_error: true };
 
@@ -338,7 +350,7 @@ async function handlePauseResume(ctx: AgentToolContext, input: Record<string, un
 
   await ctx.db.update(staffAgents).set({ status: newStatus, updatedAt: new Date() }).where(eq(staffAgents.id, agent.id));
 
-  // Fix #1: actually stop/start the Telegram bot
+  // Stop/start the Telegram bot
   if (ctx.multiRelay) {
     if (newStatus === "paused") {
       await ctx.multiRelay.stopBot(agent.id).catch(() => {});
@@ -347,7 +359,13 @@ async function handlePauseResume(ctx: AgentToolContext, input: Record<string, un
     }
   }
 
-  return { content: `Agent "${agent.name}" ${newStatus === "paused" ? "paused" : "resumed"}.` };
+  // Disable/enable scheduled tasks to match agent status
+  ctx.db.update(scheduledTasks)
+    .set({ enabled: newStatus === "active" })
+    .where(eq(scheduledTasks.agentId, agent.id))
+    .run();
+
+  return { content: `Agent "${agent.name}" ${newStatus === "paused" ? "paused — scheduled tasks disabled" : "resumed — scheduled tasks re-enabled"}.` };
 }
 
 async function handleUpdateAssignment(ctx: AgentToolContext, input: Record<string, unknown>): Promise<ToolResult> {

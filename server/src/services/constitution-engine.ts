@@ -203,6 +203,15 @@ export class ConstitutionEngine {
       };
     }
 
+    // Reject messages for paused or deleted agents
+    if (agent.status !== "active") {
+      return {
+        response: "This agent is currently unavailable.",
+        blocked: true,
+        policyEvents: [],
+      };
+    }
+
     // -- 2. Load constitution clauses (cached) -----------------------
     let cached: CachedConstitution;
     try {
