@@ -627,7 +627,8 @@ class ClaudeAgentSdkAdapter implements Adapter {
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         settingSources: ["user"],
-        maxTurns: MAX_TURNS,
+        maxTurns: params.maxTurns ?? MAX_TURNS,
+        ...(params.cwd ? { cwd: params.cwd } : {}),
         canUseTool: canUseToolCallback,
         tools: params.builtinTools ?? [],
         allowedTools: allAllowedTools.length > 0 ? allAllowedTools : undefined,
@@ -636,6 +637,10 @@ class ClaudeAgentSdkAdapter implements Adapter {
         ...(onTextDelta ? { includePartialMessages: true } : {}),
         // Resume existing session for conversation continuity
         ...(params.resumeSessionId ? { resume: params.resumeSessionId } : {}),
+        // v0.4 cancel-actually-stops-compute: when the dispatcher aborts this
+        // controller, the SDK terminates the CLI subprocess and the for-await
+        // below throws. We catch, tag as aborted, and return an aborted result.
+        ...(params.abortController ? { abortController: params.abortController } : {}),
         env,
       },
     });

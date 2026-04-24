@@ -19,7 +19,7 @@ import type { Db } from "@carsonos/db";
 import { staffAgents, familyMembers, staffAssignments } from "@carsonos/db";
 import { eq, and } from "drizzle-orm";
 import type { ConstitutionEngine } from "./constitution-engine.js";
-import type { DelegationOrchestrator } from "./delegation-orchestrator.js";
+import type { DelegationService } from "./delegation-service.js";
 import type { Adapter } from "./subprocess-adapter.js";
 import { createTelegramStream } from "./telegram-streaming.js";
 import { markdownToTelegramHtml, stripThinkingBlocks } from "./telegram-format.js";
@@ -30,7 +30,7 @@ interface MultiRelayConfig {
   db: Db;
   adapter: Adapter;
   engine: ConstitutionEngine;
-  orchestrator: DelegationOrchestrator;
+  orchestrator: DelegationService;
 }
 
 interface ManagedBot {
@@ -96,13 +96,58 @@ export class SharedRateLimiter {
   }
 }
 
+// ── Transient-error detection ──────────────────────────────────────
+
+/**
+ * Network codes we retry on. Telegram API failures wrapped by grammy
+ * surface these in the error message chain — `ETIMEDOUT` (slow route),
+ * `ECONNRESET` (TCP drop), `EAI_AGAIN` (DNS flake), `ENETUNREACH`
+ * (offline), `ECONNREFUSED` (Telegram edge down). All resolve on their
+ * own given enough time.
+ *
+ * Explicitly NOT in this set: 401/403/"unauthorized" (auth failure — bot
+ * token is wrong, retrying won't help).
+ */
+const TRANSIENT_ERROR_MARKERS = [
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "ECONNREFUSED",
+  "socket hang up",
+  "fetch failed",
+];
+
+function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+function isTransientNetworkError(err: unknown): boolean {
+  const chain: string[] = [];
+  let cursor: unknown = err;
+  // Walk up to 5 levels of nested `cause` so grammy's wrapped node-fetch
+  // errors still match (HttpError → FetchError → node:net Error).
+  for (let i = 0; i < 5 && cursor; i++) {
+    if (cursor instanceof Error) {
+      chain.push(cursor.message);
+      cursor = (cursor as Error & { cause?: unknown }).cause;
+    } else {
+      chain.push(String(cursor));
+      break;
+    }
+  }
+  const joined = chain.join(" | ");
+  return TRANSIENT_ERROR_MARKERS.some((m) => joined.includes(m));
+}
+
 // ── Multi-Relay Manager ─────────────────────────────────────────────
 
 export class MultiRelayManager {
   private db: Db;
   private adapter: Adapter;
   private engine: ConstitutionEngine;
-  private orchestrator: DelegationOrchestrator;
+  private orchestrator: DelegationService;
   private bots = new Map<string, ManagedBot>();
   private rateLimiter = new SharedRateLimiter();
   private debounceBuffers = new Map<string, DebounceBuffer>();
@@ -360,30 +405,133 @@ export class MultiRelayManager {
       });
     }
 
-    // Clear any stale webhook, then start with runner
-    try {
-      await bot.api.deleteWebhook({ drop_pending_updates: false });
+    // v0.4: inline-button handler for hire / delegation approval cards.
+    // callback_data format: "<action>:<taskId>" where action is
+    // "approve" | "reject". Grammy only emits callback_query:data when
+    // the payload carries data (filters out non-data callbacks).
+    bot.on("callback_query:data", async (ctx) => {
+      try {
+        const raw = ctx.callbackQuery.data;
+        const [action, taskId] = raw.split(":", 2);
+        if (!taskId || (action !== "approve" && action !== "reject")) {
+          await ctx.answerCallbackQuery({ text: "Unknown action" }).catch(() => {});
+          return;
+        }
+        const telegramUserId = String(ctx.from?.id ?? "");
+        if (!telegramUserId) {
+          await ctx.answerCallbackQuery({ text: "No Telegram user id" }).catch(() => {});
+          return;
+        }
 
-      const runner = run(bot, {
-        runner: {
-          // Short long-poll so runner.stop() returns within a few seconds
-          // during hot reloads. Telegram still pushes updates instantly when
-          // present — this only caps how long an idle poll blocks.
-          fetch: { timeout: POLL_TIMEOUT_S },
-          silent: true,
-        },
-        sink: { concurrency: 4 },
-      });
+        // Authorization: only family members with role='parent' can approve
+        // hires. Resolving via telegramUserId prevents a kid (or a stranger
+        // added to the bot chat) from tapping Approve on a message they
+        // shouldn't decide on. Forwarded/shared messages hit the same gate.
+        const [approver] = await this.db
+          .select()
+          .from(familyMembers)
+          .where(eq(familyMembers.telegramUserId, telegramUserId))
+          .limit(1);
+        if (!approver) {
+          await ctx
+            .answerCallbackQuery({ text: "Not a recognized family member" })
+            .catch(() => {});
+          return;
+        }
+        if (approver.role !== "parent") {
+          await ctx
+            .answerCallbackQuery({ text: "Only a parent can approve hires" })
+            .catch(() => {});
+          return;
+        }
+        const approvedBy = approver.id;
 
-      managed.runner = runner;
-      managed.running = true;
-      this.bots.set(agentId, managed);
+        const result =
+          action === "approve"
+            ? await this.orchestrator.handleHireApproval(taskId, approvedBy)
+            : await this.orchestrator.handleHireRejection(taskId, approvedBy);
 
-      console.log(`[multi-relay] Bot started for ${agent.name} (${agentId})`);
-    } catch (err) {
-      console.error(`[multi-relay] Failed to start bot for ${agent.name}:`, err);
-      // Don't set status to idle on start failure — it prevents recovery on restart
+        if (!result.ok) {
+          await ctx.answerCallbackQuery({ text: result.error.slice(0, 200) }).catch(() => {});
+          return;
+        }
+
+        if (result.alreadyResolved) {
+          await ctx.answerCallbackQuery({ text: "Already handled" }).catch(() => {});
+          return;
+        }
+
+        await ctx
+          .answerCallbackQuery({ text: action === "approve" ? "Approved" : "Rejected" })
+          .catch(() => {});
+
+        // Strip the buttons and stamp the card so the user can see what they chose.
+        try {
+          const original = ctx.callbackQuery.message?.text ?? "";
+          const stamp = action === "approve" ? "✅ Approved" : "❌ Rejected";
+          await ctx.editMessageText(`${stamp}\n\n${original}`, { reply_markup: undefined });
+        } catch {
+          // Telegram refuses edits after ~48h or on certain modifications —
+          // not load-bearing for correctness, swallow.
+        }
+      } catch (err) {
+        console.error(`[multi-relay:${agent.name}] callback_query error:`, err);
+        try { await ctx.answerCallbackQuery({ text: "Error handling action" }); } catch { /* swallow */ }
+      }
+    });
+
+    // Clear any stale webhook, then start with runner. Transient network
+    // errors (ETIMEDOUT on deleteWebhook is the common one — WiFi/DNS blips)
+    // used to leave the bot in a zombie state forever: error caught, no
+    // retry, 0 bots running, user has to manually restart the dev server.
+    // Now we back off and retry a few times for transient errors only —
+    // auth errors (401/403/"unauthorized") fail immediately since retrying
+    // won't help.
+    const START_BOT_BACKOFFS_MS = [5_000, 15_000, 45_000];
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt <= START_BOT_BACKOFFS_MS.length; attempt++) {
+      try {
+        await bot.api.deleteWebhook({ drop_pending_updates: false });
+
+        const runner = run(bot, {
+          runner: {
+            // Short long-poll so runner.stop() returns within a few seconds
+            // during hot reloads. Telegram still pushes updates instantly when
+            // present — this only caps how long an idle poll blocks.
+            fetch: { timeout: POLL_TIMEOUT_S },
+            silent: true,
+          },
+          sink: { concurrency: 4 },
+        });
+
+        managed.runner = runner;
+        managed.running = true;
+        this.bots.set(agentId, managed);
+
+        console.log(
+          `[multi-relay] Bot started for ${agent.name} (${agentId})` +
+            (attempt > 0 ? ` [recovered after ${attempt} retr${attempt === 1 ? "y" : "ies"}]` : ""),
+        );
+        return;
+      } catch (err) {
+        lastErr = err;
+        const transient = isTransientNetworkError(err);
+        const nextDelay = START_BOT_BACKOFFS_MS[attempt];
+        if (!transient || nextDelay === undefined) {
+          break;
+        }
+        console.warn(
+          `[multi-relay] Transient failure starting ${agent.name} (attempt ${attempt + 1}/${START_BOT_BACKOFFS_MS.length + 1}), retrying in ${nextDelay / 1000}s:`,
+          errMessage(err),
+        );
+        await new Promise((resolve) => setTimeout(resolve, nextDelay));
+      }
     }
+    console.error(
+      `[multi-relay] Failed to start bot for ${agent.name} after ${START_BOT_BACKOFFS_MS.length + 1} attempts:`,
+      lastErr,
+    );
+    // Don't set status to idle on start failure — it prevents recovery on restart.
   }
 
   async stopBot(agentId: string): Promise<void> {
@@ -618,25 +766,9 @@ export class MultiRelayManager {
       return;
     }
 
-    // 2. Delegation orchestrator
-    const conversationId = await this.getConversationId(
-      agentId, member.id, member.householdId,
-    );
-
-    const delegationResult = await this.orchestrator.handleAgentResponse(
-      agentId, member.id, member.householdId, conversationId, engineResult.response,
-    );
-
-    if (delegationResult.warnings?.length) {
-      for (const warning of delegationResult.warnings) {
-        console.warn(`[multi-relay:${agentName}] Delegation warning: ${warning}`);
-      }
-    }
-
-    // 3. Send final formatted response
-    const finalText = delegationResult.delegated
-      ? (delegationResult.userMessage || "Working on that for you. I'll have an answer shortly.")
-      : (delegationResult.userMessage || engineResult.response);
+    // 2. Send the agent's response. v0.4 delegation happens via MCP tool
+    // calls during the agent's turn — no post-response XML parsing step.
+    const finalText = engineResult.response;
 
     if (streamMsgId) {
       // Streaming already formatted HTML in-place — nothing more to do.
@@ -805,9 +937,70 @@ export class MultiRelayManager {
 
   /**
    * Send a message to a Telegram user via a specific agent's bot.
-   * Used by the scheduler for delivering scheduled task results.
+   * v0.4: accepts optional `replyMarkup` (inline buttons) and returns the
+   * message id of the sent message — the notifier stores it in
+   * delegation_notifications for server-side dedup so a retry after a
+   * silent Telegram success becomes a no-op.
+   *
+   * When `replyMarkup` is present, we truncate to a single message (inline
+   * keyboards can't span chunks) instead of splitting the payload.
    */
-  async sendMessage(agentId: string, telegramUserId: string, text: string): Promise<void> {
+  /** Edit a previously-sent message and strip its inline buttons. Used by
+   * the web-UI approval path to stamp the Telegram approval card with
+   * "✅ Approved" so a parent approving a hire from the dashboard doesn't
+   * leave live Approve/Reject buttons sitting in the chat. Idempotent-ish:
+   * Telegram returns "message is not modified" if we edit to the same text;
+   * we swallow that.
+   *
+   * Returns true on successful edit, false on any error — caller decides
+   * whether a failed edit is load-bearing (usually it isn't). */
+  async editMessage(
+    agentId: string,
+    telegramUserId: string,
+    messageId: number | string,
+    text: string,
+  ): Promise<boolean> {
+    const managed = this.bots.get(agentId);
+    if (!managed?.running) return false;
+    try {
+      await managed.bot.api.editMessageText(
+        telegramUserId,
+        Number(messageId),
+        text,
+        { parse_mode: "HTML", reply_markup: undefined },
+      );
+      return true;
+    } catch (err) {
+      // Already-edited / 48h window / plain-text conflict — not load-bearing.
+      console.warn(`[multi-relay:${managed.agentName}] editMessage(${messageId}) failed:`, err);
+      return false;
+    }
+  }
+
+  /** Serialize an async operation behind the agent's in-flight user turn,
+   * if any. Used by the v0.4 back-channel wake so a task-completion turn
+   * doesn't race a real user message on the same Agent SDK session.
+   *
+   * Chain is shared with `flushBuffer`'s queue — user messages + wakes are
+   * merged into one per-agent ordered stream. Returns a promise that
+   * resolves when the enqueued work finishes (success or failure). */
+  async enqueueAgentWork(agentId: string, fn: () => Promise<void>): Promise<void> {
+    const previousWork = this.agentQueues.get(agentId) ?? Promise.resolve();
+    const currentWork = previousWork
+      .catch(() => {
+        // Previous work failed; shouldn't block this one.
+      })
+      .then(fn);
+    this.agentQueues.set(agentId, currentWork);
+    await currentWork;
+  }
+
+  async sendMessage(
+    agentId: string,
+    telegramUserId: string,
+    text: string,
+    options: { replyMarkup?: unknown } = {},
+  ): Promise<{ messageId?: string }> {
     const managed = this.bots.get(agentId);
     if (!managed?.running) {
       throw new Error(`Bot for agent ${agentId} is not running`);
@@ -815,18 +1008,44 @@ export class MultiRelayManager {
 
     const { markdownToTelegramHtml, chunkMessage } = await import("./telegram-format.js");
     const html = markdownToTelegramHtml(text);
-    const chunks = chunkMessage(html);
 
+    if (options.replyMarkup) {
+      // Inline keyboard path — single message only.
+      const truncated =
+        html.length > MAX_MESSAGE_LENGTH ? html.slice(0, MAX_MESSAGE_LENGTH - 20) + "…" : html;
+      try {
+        const sent = await managed.bot.api.sendMessage(telegramUserId, truncated, {
+          parse_mode: "HTML",
+          reply_markup: options.replyMarkup as never,
+        });
+        return { messageId: String(sent.message_id) };
+      } catch {
+        const plain = text.length > MAX_MESSAGE_LENGTH - 20 ? text.slice(0, MAX_MESSAGE_LENGTH - 20) : text;
+        const sent = await managed.bot.api.sendMessage(telegramUserId, plain, {
+          reply_markup: options.replyMarkup as never,
+        });
+        return { messageId: String(sent.message_id) };
+      }
+    }
+
+    // Chunk path — no markup, text can span multiple messages.
+    const chunks = chunkMessage(html);
+    let lastMessageId: string | undefined;
     for (const chunk of chunks) {
       if (!chunk.trim()) continue;
       try {
-        await managed.bot.api.sendMessage(telegramUserId, chunk, { parse_mode: "HTML" });
+        const sent = await managed.bot.api.sendMessage(telegramUserId, chunk, { parse_mode: "HTML" });
+        lastMessageId = String(sent.message_id);
       } catch {
-        // Fallback to plain text
-        await managed.bot.api.sendMessage(telegramUserId, text.slice(0, MAX_MESSAGE_LENGTH));
+        const sent = await managed.bot.api.sendMessage(
+          telegramUserId,
+          text.slice(0, MAX_MESSAGE_LENGTH),
+        );
+        lastMessageId = String(sent.message_id);
         break;
       }
     }
+    return { messageId: lastMessageId };
   }
 
   /**
@@ -874,52 +1093,6 @@ export class MultiRelayManager {
       }
     }
     return false;
-  }
-
-  // ── Helpers ───────────────────────────────────────────────────────
-
-  private async getConversationId(
-    agentId: string,
-    memberId: string,
-    householdId: string,
-  ): Promise<string> {
-    const { conversations } = await import("@carsonos/db");
-    const { desc } = await import("drizzle-orm");
-
-    const today = new Date().toISOString().slice(0, 10);
-
-    const existing = await this.db
-      .select()
-      .from(conversations)
-      .where(
-        and(
-          eq(conversations.agentId, agentId),
-          eq(conversations.memberId, memberId),
-          eq(conversations.householdId, householdId),
-          eq(conversations.channel, "telegram"),
-        ),
-      )
-      .orderBy(desc(conversations.startedAt))
-      .limit(1);
-
-    if (existing.length > 0 && existing[0].startedAt.startsWith(today)) {
-      return existing[0].id;
-    }
-
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-
-    await this.db.insert(conversations).values({
-      id,
-      agentId,
-      memberId,
-      householdId,
-      channel: "telegram",
-      startedAt: now,
-      lastMessageAt: now,
-    });
-
-    return id;
   }
 
   private logMemory(): void {

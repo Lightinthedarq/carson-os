@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { eq, and } from "drizzle-orm";
 import type { Db } from "@carsonos/db";
-import { toolGrants, staffAgents } from "@carsonos/db";
+import { toolGrants, staffAgents, instanceSettings } from "@carsonos/db";
 import type {
   ToolDefinition,
   ToolExecutor,
@@ -40,6 +40,11 @@ import {
   executeScriptTool,
 } from "./custom-tools/index.js";
 import type { CustomRegistration } from "./custom-tools/index.js";
+import {
+  DELEGATION_TOOLS,
+  DELEGATION_TOOL_NAMES,
+  handleDelegationTool,
+} from "./delegation/delegation-tools.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -89,6 +94,13 @@ export interface ToolExecutionContext {
   allowedCollections?: string[];
   /** Multi-relay manager for bot control (pause/resume agents) */
   multiRelay?: import("./multi-relay-manager.js").MultiRelayManager;
+  /** v0.4 delegation: service that creates + dispatches child tasks via MCP tool calls. */
+  delegationService?: import("./delegation-service.js").DelegationService;
+  /** v0.4 delegation: oversight for hire proposal escalation. */
+  oversight?: import("./carson-oversight.js").CarsonOversight;
+  /** v0.4 delegation: the caller's current task row id, when this executor is
+   * running inside a task (Dispatcher path). undefined for normal agent turns. */
+  callerTaskId?: string;
 }
 
 // ── Trust level → Claude Code built-in tools ────────────────────────
@@ -117,6 +129,19 @@ const CUSTOM_TOOL_MGMT_GRANTS = [
   "redact_recent_user_message",
 ];
 
+// v0.4 delegation tools — granted to agents who can initiate delegation.
+// Head butler (CoS) gets the full set including register_project. Personal
+// agents get the shorter set; the hire flow routes through CoS anyway.
+const DELEGATION_GRANTS_FULL = [
+  "delegate_task", "propose_hire", "cancel_task", "list_active_tasks", "register_project",
+  // v0.4 N:M grants — CoS-only so kids can't self-authorize specialist access.
+  "grant_delegation", "revoke_delegation",
+  // v0.4 back-channel — everyone who can delegate needs to be able to read
+  // the result on demand when the user follows up.
+  "read_task_result",
+];
+const DELEGATION_GRANTS_PERSONAL = ["delegate_task", "cancel_task", "list_active_tasks", "read_task_result"];
+
 const DEFAULT_GRANTS: Record<string, string[]> = {
   head_butler: [
     "search_memory", "read_memory", "save_memory", "delete_memory", "update_instructions",
@@ -124,12 +149,14 @@ const DEFAULT_GRANTS: Record<string, string[]> = {
     "gmail_triage", "gmail_read", "gmail_compose", "gmail_reply", "gmail_update_draft", "gmail_send_draft", "gmail_search",
     "drive_search", "drive_list",
     ...CUSTOM_TOOL_MGMT_GRANTS,
+    ...DELEGATION_GRANTS_FULL,
   ],
   personal: [
     "search_memory", "read_memory", "save_memory", "delete_memory", "update_instructions",
     "list_calendar_events", "create_calendar_event", "get_calendar_event",
     "gmail_triage", "gmail_read", "gmail_compose", "gmail_reply", "gmail_update_draft", "gmail_send_draft", "gmail_search",
     "drive_search", "drive_list",
+    ...DELEGATION_GRANTS_PERSONAL,
   ],
   tutor: [
     "search_memory", "read_memory", "save_memory", "update_instructions",
@@ -171,6 +198,10 @@ export class ToolRegistry {
 
   setDataDir(dataDir: string): void {
     this.dataDir = dataDir;
+  }
+
+  getDataDir(): string | undefined {
+    return this.dataDir;
   }
 
   /** Register all built-in tools (memory, operating instructions). */
@@ -236,6 +267,18 @@ export class ToolRegistry {
       this.tools.set(def.name, {
         definition: def,
         category: "redaction",
+        tier: "builtin",
+      });
+    }
+
+    // v0.4 delegation tools — registered in the `builtin` tier, role-gated via
+    // DEFAULT_GRANTS so only head_butler + personal see them unless explicitly
+    // granted. The registry already special-cases routing via
+    // DELEGATION_TOOL_NAMES in buildExecutor().
+    for (const def of DELEGATION_TOOLS) {
+      this.tools.set(def.name, {
+        definition: def,
+        category: "delegation",
         tier: "builtin",
       });
     }
@@ -629,6 +672,30 @@ export class ToolRegistry {
         return result;
       }
 
+      // v0.4 delegation tools (delegate_task, propose_hire, cancel_task,
+      // list_active_tasks, register_project) — routed to the delegation service.
+      if (DELEGATION_TOOL_NAMES.has(name)) {
+        if (!ctx.delegationService || !ctx.oversight) {
+          const result: ToolResult = {
+            content: `Delegation tool '${name}' called but delegationService/oversight not wired into context.`,
+            is_error: true,
+          };
+          calls.push({ name, input, result });
+          return result;
+        }
+        const result = await handleDelegationTool(name, input, {
+          db: ctx.db,
+          agentId: ctx.agentId,
+          householdId: ctx.householdId,
+          memberId: ctx.memberId,
+          callerTaskId: ctx.callerTaskId,
+          delegationService: ctx.delegationService,
+          oversight: ctx.oversight,
+        });
+        calls.push({ name, input, result });
+        return result;
+      }
+
       // Redaction tools (scrub sensitive content from the DB post-processing)
       if (REDACTION_TOOL_NAMES.has(name)) {
         const result = await handleRedactionTool(
@@ -642,6 +709,17 @@ export class ToolRegistry {
 
       // Custom tool system tools (create_http_tool, store_secret, etc.)
       if (CUSTOM_TOOL_NAMES.has(name)) {
+        // Developer agents with specialty=tools are trusted to create active
+        // script tools without a review gate (v0.4 premise: tool-building
+        // Devs exist precisely so average users don't have to approve every
+        // tool). Chief of Staff keeps the legacy bypass too.
+        const [callerAgent] = await this.db
+          .select({ specialty: staffAgents.specialty, staffRole: staffAgents.staffRole })
+          .from(staffAgents)
+          .where(eq(staffAgents.id, ctx.agentId))
+          .limit(1);
+        const isToolsDeveloper =
+          callerAgent?.staffRole === "custom" && callerAgent?.specialty === "tools";
         const result = await handleCustomToolSystemTool(
           {
             db: ctx.db,
@@ -650,6 +728,7 @@ export class ToolRegistry {
             toolRegistry: this,
             dataDir: this.dataDir,
             isChiefOfStaff: ctx.isChiefOfStaff ?? false,
+            canCreateActiveTools: isToolsDeveloper,
             onToolChanged: async (event) => this.handleToolChange(ctx.householdId, event),
           },
           name,
@@ -701,6 +780,90 @@ export class ToolRegistry {
   }
 
   // ── Grant management ──────────────────────────────────────────────
+
+  /**
+   * Boot-time reconciliation: seed agents with any role-default tools they
+   * haven't seen yet. Protects future DEFAULT_GRANTS changes — e.g., v0.4
+   * adds delegation tools, v0.5 adds whatever next — from the silent bug
+   * where existing agents with explicit grants miss the new defaults.
+   *
+   * Per-agent marker in instance_settings (`grants_seeded:<agentId>` →
+   * JSON array of tool names already seeded for that agent). User
+   * revocations after seeding persist — a revoked tool stays in the seeded
+   * list, so the reconciler never re-adds it. Only genuinely new defaults
+   * get seeded.
+   *
+   * Head-butler-via-flag: if `is_head_butler=1` we use head_butler defaults
+   * regardless of staff_role (legacy head-butler rows often have role=
+   * "personal"). Matches the authoritative "this is the CoS" semantic.
+   */
+  async seedMissingDefaults(): Promise<void> {
+    const agents = await this.db
+      .select({
+        id: staffAgents.id,
+        staffRole: staffAgents.staffRole,
+        isHeadButler: staffAgents.isHeadButler,
+      })
+      .from(staffAgents);
+
+    for (const agent of agents) {
+      const effectiveRole = agent.isHeadButler ? "head_butler" : agent.staffRole;
+      const defaults = DEFAULT_GRANTS[effectiveRole] ?? DEFAULT_GRANTS.custom;
+      if (defaults.length === 0) continue;
+
+      const settingKey = `grants_seeded:${agent.id}`;
+      const [setting] = await this.db
+        .select()
+        .from(instanceSettings)
+        .where(eq(instanceSettings.key, settingKey))
+        .limit(1);
+      const alreadySeeded: string[] = Array.isArray(setting?.value)
+        ? (setting!.value as string[])
+        : [];
+
+      // Only seed tools this agent has never seen before. User-revoked
+      // tools are in `alreadySeeded` so they don't get re-added.
+      const toSeed = defaults.filter(
+        (name) => !alreadySeeded.includes(name) && this.tools.has(name),
+      );
+      if (toSeed.length === 0) continue;
+
+      // Insert grants idempotently — agent may already have some of these via
+      // an earlier materializeDefaults pass; the unique index on
+      // (agentId, toolName) makes the conflict a no-op.
+      await this.db
+        .insert(toolGrants)
+        .values(
+          toSeed.map((toolName) => ({
+            agentId: agent.id,
+            toolName,
+            grantedBy: "system-seed",
+          })),
+        )
+        .onConflictDoNothing();
+
+      // Mark the FULL current defaults set as seeded, not just what we
+      // inserted. That way a revocation of toSeed[k] between v0.4 and v0.5
+      // doesn't get re-seeded at v0.5 — it stays in alreadySeeded forever.
+      const newSeeded = [...new Set([...alreadySeeded, ...defaults])];
+      if (setting) {
+        await this.db
+          .update(instanceSettings)
+          .set({ value: newSeeded })
+          .where(eq(instanceSettings.key, settingKey));
+      } else {
+        await this.db.insert(instanceSettings).values({
+          id: crypto.randomUUID(),
+          key: settingKey,
+          value: newSeeded,
+        });
+      }
+
+      console.log(
+        `[tools] Seeded ${toSeed.length} default grant(s) for ${effectiveRole} agent ${agent.id}: ${toSeed.join(", ")}`,
+      );
+    }
+  }
 
   /**
    * Materialize role defaults into tool_grants table.

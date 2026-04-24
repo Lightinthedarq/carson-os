@@ -26,6 +26,7 @@ import type { PersonalityInterviewEngine } from "./services/personality-intervie
 import type { ToolRegistry } from "./services/tool-registry.js";
 import type { MultiRelayManager } from "./services/multi-relay-manager.js";
 import type { SignalRelayManager } from "./services/signal-relay-manager.js";
+import type { DelegationService } from "./services/delegation-service.js";
 
 import { createHealthRoutes } from "./routes/health.js";
 import { createHouseholdRoutes } from "./routes/households.js";
@@ -40,6 +41,7 @@ import { createActivityRoutes } from "./routes/activity.js";
 import { createSettingsRoutes } from "./routes/settings.js";
 import { createProfileRoutes } from "./routes/profiles.js";
 import { createScheduledTaskRoutes } from "./routes/scheduled-tasks.js";
+import { createProjectRoutes } from "./routes/projects.js";
 
 const __dirname = resolve(fileURLToPath(import.meta.url), "..");
 
@@ -49,6 +51,7 @@ export interface AppDeps {
   constitutionEngine: ConstitutionEngine;
   taskEngine: TaskEngine;
   oversight: CarsonOversight;
+  delegationService: DelegationService;
   interviewEngine: InterviewEngine;
   profileInterviewEngine: ProfileInterviewEngine;
   personalityInterviewEngine: PersonalityInterviewEngine;
@@ -75,9 +78,32 @@ export async function createApp(deps: AppDeps): Promise<express.Express> {
 
   // CORS -- only allow requests from the dashboard UI origin
   const port = process.env.PORT || "3300";
+  const allowedOrigins = [`http://localhost:${port}`, `http://127.0.0.1:${port}`];
   app.use("/api", cors({
-    origin: [`http://localhost:${port}`, `http://127.0.0.1:${port}`],
+    origin: allowedOrigins,
+    credentials: true,
   }));
+
+  // Same-origin gate on state-changing methods. CORS protects browsers from
+  // cross-origin requests but does not stop a local process (e.g., a Developer
+  // agent with Bash curling 127.0.0.1:3300) from hitting mutation endpoints.
+  // Requiring Origin or Referer to match our UI origin adds friction: the
+  // caller has to know + spoof the header explicitly, and browser-initiated
+  // requests from our UI always include it automatically. GET/HEAD/OPTIONS
+  // bypass the check so read-only traffic stays unaffected.
+  const STATE_CHANGING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+  app.use("/api", (req: Request, res: Response, next: NextFunction) => {
+    if (!STATE_CHANGING.has(req.method)) return next();
+    const origin = req.get("origin") ?? "";
+    const referer = req.get("referer") ?? "";
+    const refererOk = allowedOrigins.some((o) => referer.startsWith(o + "/"));
+    const originOk = allowedOrigins.includes(origin);
+    if (originOk || refererOk) return next();
+    res.status(403).json({
+      error:
+        "mutation requires same-origin request (Origin or Referer header matching the dashboard origin)",
+    });
+  });
 
   // JSON body parsing (Express 5 built-in, 1 MB limit)
   // Must come before Vite middleware so API routes parse JSON bodies
@@ -94,8 +120,8 @@ export async function createApp(deps: AppDeps): Promise<express.Express> {
   app.use("/api/health", createHealthRoutes({ adapter }));
   app.use("/api/households", createHouseholdRoutes(db));
   app.use("/api/households", createMemberRoutes(db));
-  app.use("/api/staff", createStaffRoutes({ db, personalityInterviewEngine, multiRelay: deps.multiRelay, signalRelay: deps.signalRelay }));
-  app.use("/api/tasks", createTaskRoutes({ db, taskEngine, oversight }));
+  app.use("/api/staff", createStaffRoutes({ db, personalityInterviewEngine, multiRelay: deps.multiRelay, signalRelay: deps.signalRelay, delegationService: deps.delegationService }));
+  app.use("/api/tasks", createTaskRoutes({ db, taskEngine, oversight, delegationService: deps.delegationService }));
   app.use(
     "/api/constitution",
     createConstitutionRoutes({ db, constitutionEngine, interviewEngine }),
@@ -111,6 +137,7 @@ export async function createApp(deps: AppDeps): Promise<express.Express> {
   app.use("/api/activity", createActivityRoutes(db));
   app.use("/api/settings", createSettingsRoutes(db));
   app.use("/api/scheduled-tasks", createScheduledTaskRoutes(db));
+  app.use("/api/projects", createProjectRoutes(db));
   app.use("/api/tools", createToolRoutes({ db, toolRegistry }));
   app.use(
     "/api/members",

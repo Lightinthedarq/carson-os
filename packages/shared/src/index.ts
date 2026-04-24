@@ -298,6 +298,20 @@ export interface AdapterExecuteParams {
    * they just built, rather than waiting for the next conversation.
    */
   refreshTools?: () => Promise<{ tools: ToolDefinition[]; toolExecutor: ToolExecutor }>;
+  /** v0.4 delegation: working directory for the child process (SDK's query cwd).
+   * Used by the Dispatcher to run Developer tasks inside a git worktree or
+   * tool sandbox. Falls back to the adapter's default (process.cwd) when absent. */
+  cwd?: string;
+  /** v0.4 delegation: per-task turn cap override. Family agents default to the
+   * env-driven MAX_TURNS (50). Developer tasks pass 200 (SDK hard ceiling) so
+   * long refactors don't truncate mid-work. See design premise 9a. */
+  maxTurns?: number;
+  /** v0.4 delegation: forwarded to the Agent SDK so a caller can actually stop
+   * compute when a task is cancelled. Aborting this controller causes the SDK
+   * to terminate the underlying CLI subprocess and reject the query's async
+   * iterator — the adapter turns that into a clean cancelled result instead of
+   * a status-overwriting `completed`. */
+  abortController?: AbortController;
 }
 
 export interface AdapterExecuteResult {

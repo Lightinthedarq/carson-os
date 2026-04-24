@@ -34,7 +34,15 @@ import { InterviewEngine } from "./services/interview.js";
 import { ProfileInterviewEngine } from "./services/profile-interview.js";
 import { PersonalityInterviewEngine } from "./services/personality-interview.js";
 import { Dispatcher } from "./services/dispatcher.js";
-import { DelegationOrchestrator } from "./services/delegation-orchestrator.js";
+import { DelegationService } from "./services/delegation-service.js";
+import { WorkspaceProvider } from "./services/delegation/workspace.js";
+import {
+  DelegationNotifier,
+  type TelegramSendFn,
+  type TelegramSendResult,
+} from "./services/delegation/notifier.js";
+import { familyMembers, tasks as tasksTable, conversations, messages, delegationNotifications } from "@carsonos/db";
+import { and, desc, eq } from "drizzle-orm";
 import { MultiRelayManager } from "./services/multi-relay-manager.js";
 import { SignalRelayManager } from "./services/signal-relay-manager.js";
 import { bootMemory } from "./services/memory/index.js";
@@ -197,6 +205,12 @@ async function main() {
 
   console.log(`[tools] Registry ready (${toolRegistry.listAll().length} tools registered)`);
 
+  // Seed any newly-added role defaults to existing agents (protects v0.4+
+  // DEFAULT_GRANTS changes from the "agents with explicit grants silently
+  // miss new role defaults" bug). Per-agent marker in instance_settings so
+  // user revocations survive future release cycles.
+  await toolRegistry.seedMissingDefaults();
+
   // 3. Constitution engine
   const constitutionEngine = new ConstitutionEngine({
     db,
@@ -249,23 +263,68 @@ async function main() {
   });
   console.log("[engine] Personality interview engine ready");
 
-  // 6b. Dispatcher (on-demand spawn for internal agent tasks)
+  // 6b-1. Workspace provider (v0.4: per-task git worktree + tool sandbox)
+  const workspace = new WorkspaceProvider();
+
+  // 6b-2. Telegram send fn for the notifier. multiRelay doesn't exist yet
+  // (boot order: dispatcher → delegation-service → multiRelay), so the send
+  // closure resolves the reference lazily. Until multiRelay is bound, sends
+  // fail loud so the reconciler retries on next boot — never drops a payload.
+  let multiRelayRef: MultiRelayManager | null = null;
+  const notifierSend: TelegramSendFn = async (args): Promise<TelegramSendResult> => {
+    if (!multiRelayRef) return { ok: false, error: "multiRelay not ready yet" };
+    const [member] = await db
+      .select()
+      .from(familyMembers)
+      .where(eq(familyMembers.id, args.memberId))
+      .limit(1);
+    if (!member?.telegramUserId) {
+      return { ok: false, error: `no telegram user id for member ${args.memberId}` };
+    }
+    try {
+      const { messageId } = await multiRelayRef.sendMessage(
+        args.agentId,
+        member.telegramUserId,
+        args.text,
+        { replyMarkup: args.replyMarkup },
+      );
+      return { ok: true, messageId };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+  const notifier = new DelegationNotifier(db, notifierSend);
+
+  // 6b-3. Dispatcher with v0.4 deps wired
   const dispatcher = new Dispatcher({
     db,
     adapter,
     broadcast: eventBus.publish,
+    workspace,
+    notifier,
+    toolRegistry,
   });
-  // Recover any tasks stuck in in_progress from a previous crash
+  // Recover any tasks stuck in in_progress from a previous crash. Phase-2
+  // notifier replay happens AFTER multiRelay is bound (below); running it
+  // here would silently fail because notifierSend can't reach multiRelayRef
+  // yet.
   await dispatcher.recoverStuckTasks();
   console.log("[engine] Dispatcher ready (stuck tasks recovered)");
 
-  // 6c. Delegation orchestrator (coordinates delegation lifecycle)
-  const orchestrator = new DelegationOrchestrator(
+  // 6c. Delegation service (coordinates delegation lifecycle; v0.4)
+  const orchestrator = new DelegationService(
     { db, adapter, broadcast: eventBus.publish },
     dispatcher,
     taskEngine,
   );
-  console.log("[engine] Delegation orchestrator ready");
+  orchestrator.setOversight(oversight);
+  orchestrator.setNotifier(notifier);
+  dispatcher.setDelegationContext(orchestrator, oversight);
+  constitutionEngine.setDelegation(orchestrator, oversight);
+  console.log("[engine] Delegation service ready (v0.4: MCP delegate_task + hire flow)");
 
   // 7. Telegram multi-relay (created before app so staff routes can trigger bot starts)
   const multiRelay = new MultiRelayManager({
@@ -274,9 +333,25 @@ async function main() {
     engine: constitutionEngine,
     orchestrator,
   });
+  multiRelayRef = multiRelay; // bind the notifier's Telegram send target
+  // Phase-2 notifier replay must wait until AFTER multiRelay.startAll() has
+  // actually started the agent bots — `sendMessage` throws "Bot for agent X
+  // is not running" if the bot isn't started yet. Deferred until after the
+  // startAll() call below.
 
   // Wire multiRelay into the constitution engine (for agent pause/resume tools)
   constitutionEngine.setMultiRelay(multiRelay);
+
+  // v0.4 back-channel wake: when a delegated task completes, DelegationService
+  // runs a turn on the delegator's session via processMessage and relays the
+  // reply through multiRelay.sendMessage. Wire both deps now that both exist.
+  orchestrator.setEngineForWake({
+    processMessage: (p) => constitutionEngine.processMessage({ ...p, channel: p.channel as "telegram" | "web" }),
+  });
+  orchestrator.setSenderForWake((agentId, telegramUserId, text) =>
+    multiRelay.sendMessage(agentId, telegramUserId, text),
+  );
+  orchestrator.setAgentQueueForWake((agentId, fn) => multiRelay.enqueueAgentWork(agentId, fn));
 
   // 7b. Signal relay (agents with signal_account + signal_daemon_port set)
   const signalRelay = new SignalRelayManager({
@@ -292,6 +367,7 @@ async function main() {
     constitutionEngine,
     taskEngine,
     oversight,
+    delegationService: orchestrator,
     interviewEngine,
     profileInterviewEngine,
     personalityInterviewEngine,
@@ -309,7 +385,7 @@ async function main() {
   eventBus.on("project.completed", (event) => {
     if (!event.data) return;
     const { parentTaskId } = event.data as { parentTaskId: string };
-    orchestrator.handleProjectCompleted(parentTaskId).catch((err) => {
+    orchestrator.handleProjectCompleted(parentTaskId).catch((err: unknown) => {
       console.error("[events] Failed to handle project completion:", err);
     });
   });
@@ -320,10 +396,187 @@ async function main() {
     signalRelay.eventBus.emit("delegation.result", event.data);
   });
 
+  // v0.4: when a task is cancelled, tear down its workspace if one was provisioned.
+  eventBus.on("task.cancelled", (event) => {
+    dispatcher.handleCancelBroadcast(event).catch((err: unknown) => {
+      console.error("[events] handleCancelBroadcast failed:", err);
+    });
+  });
+
+  // v0.4: when a hire is approved, tell the principal via Carson's bot so
+  // they get visible feedback (the inline-button edit only stamps the card;
+  // the user still needs a chat message saying "Dev is on staff, what's next").
+  // Without this, the user taps Approve and hears nothing until they prompt
+  // Carson again — the dead-air problem we hit during the first real test.
+  eventBus.on("hire.approved", (event) => {
+    void (async () => {
+      const data = event.data as
+        | {
+            taskId: string;
+            householdId: string;
+            developerAgentId: string;
+            specialty: string;
+            name: string;
+          }
+        | undefined;
+      if (!data) return;
+      try {
+        const [task] = await db
+          .select({
+            agentId: tasksTable.agentId,
+            requestedBy: tasksTable.requestedBy,
+            description: tasksTable.description,
+          })
+          .from(tasksTable)
+          .where(eq(tasksTable.id, data.taskId))
+          .limit(1);
+        if (!task?.agentId || !task.requestedBy) return;
+
+        const [member] = await db
+          .select()
+          .from(familyMembers)
+          .where(eq(familyMembers.id, task.requestedBy))
+          .limit(1);
+        if (!member?.telegramUserId) return;
+
+        // Stamp the approval card with "✅ Approved" and strip the buttons.
+        // Telegram-path approvals already do this via ctx.editMessageText in
+        // the callback_query handler; this is idempotent-enough (editing to
+        // the same text just returns "not modified"), and it's the ONLY way
+        // to update the card when approval came through the Web UI instead.
+        // Previously the web-approval path left live Approve/Reject buttons
+        // sitting in Telegram — user would tap one later and race the flow.
+        const [notif] = await db
+          .select({ deliveredMessageId: delegationNotifications.deliveredMessageId, payload: delegationNotifications.payload })
+          .from(delegationNotifications)
+          .where(
+            and(
+              eq(delegationNotifications.taskId, data.taskId),
+              eq(delegationNotifications.kind, "hire_proposal"),
+            ),
+          )
+          .limit(1);
+        if (notif?.deliveredMessageId) {
+          const originalText =
+            (notif.payload && typeof notif.payload === "object" && "text" in (notif.payload as Record<string, unknown>)
+              ? String((notif.payload as Record<string, unknown>).text ?? "")
+              : "") || "";
+          const stampedText = `✅ Approved\n\n${originalText}`;
+          await multiRelay.editMessage(task.agentId, member.telegramUserId, notif.deliveredMessageId, stampedText).catch(() => {});
+        }
+
+        // Pull originalUserRequest out of the hire-proposal metadata. If the
+        // proposer passed it, auto-delegate so the user doesn't have to
+        // re-prompt. If not (proactive hire), just tell the user the
+        // specialist is ready and wait.
+        let originalUserRequest: string | undefined;
+        try {
+          const meta = task.description ? JSON.parse(task.description) : null;
+          if (meta && typeof meta.originalUserRequest === "string" && meta.originalUserRequest.trim()) {
+            originalUserRequest = meta.originalUserRequest.trim();
+          }
+        } catch {
+          // malformed description — proceed as if no originalUserRequest
+        }
+
+        if (!originalUserRequest) {
+          const text =
+            `✅ **${data.name}** is on staff — ${data.specialty} specialist.\n\n` +
+            `Tell me what you want them to work on and I'll delegate it.`;
+          await multiRelay.sendMessage(task.agentId, member.telegramUserId, text);
+          // Thread the announcement into the agent's conversation so the
+          // next turn's resumed SDK session sees "X is on staff" in
+          // history. Without this, the system prompt built at session-
+          // start is stale and Carson tells the user "X isn't on staff
+          // yet" right after he just confirmed the hire. See 2026-04-24
+          // E2E testing finding #1.
+          await threadHireAnnouncement(db, task.agentId, member.id, text, {
+            kind: "hire-approved",
+            developerAgentId: data.developerAgentId,
+            name: data.name,
+            specialty: data.specialty,
+          });
+          return;
+        }
+
+        // Auto-delegation path: run the original request through the
+        // delegation service as if the proposing agent had called
+        // delegate_task directly. No LLM turn required; handleDelegateTaskCall
+        // validates the edge (which we just created on approval), creates
+        // the task row with correct depth + workspace kind, and hands it to
+        // the dispatcher. User sees one concise status message, then the
+        // specialist's completion notification when it finishes.
+        const delegated = await orchestrator.handleDelegateTaskCall({
+          fromAgentId: task.agentId,
+          householdId: data.householdId,
+          toAgentName: data.name,
+          goal: originalUserRequest,
+          requestedByMember: member.id,
+        });
+
+        if (!delegated.ok) {
+          const text =
+            `✅ **${data.name}** is on staff.\n\n` +
+            `I tried to auto-delegate your request (_${originalUserRequest.slice(0, 120)}${originalUserRequest.length > 120 ? "…" : ""}_) but hit: ${delegated.error}\n\n` +
+            `Just tell me what you want them to do and I'll retry.`;
+          await multiRelay.sendMessage(task.agentId, member.telegramUserId, text);
+          await threadHireAnnouncement(db, task.agentId, member.id, text, {
+            kind: "hire-approved-auto-delegate-failed",
+            developerAgentId: data.developerAgentId,
+            name: data.name,
+            specialty: data.specialty,
+          });
+          return;
+        }
+
+        const text =
+          `✅ **${data.name}** is on staff — putting them on it now.\n\n` +
+          `_${originalUserRequest}_\n\n` +
+          `I'll ping you when they're done. Say "kill ${data.name}'s task" to cancel.`;
+        await multiRelay.sendMessage(task.agentId, member.telegramUserId, text);
+        await threadHireAnnouncement(db, task.agentId, member.id, text, {
+          kind: "hire-approved-auto-delegated",
+          developerAgentId: data.developerAgentId,
+          name: data.name,
+          specialty: data.specialty,
+          runId: delegated.runId,
+        });
+      } catch (err) {
+        console.error("[events] hire.approved follow-up failed:", err);
+      }
+    })();
+  });
+
   // Start per-agent bots (agents with telegramBotToken set)
   await multiRelay.startAll();
   // Start per-agent Signal accounts (agents with signal_account + signal_daemon_port set)
   await signalRelay.startAll();
+
+  // Bots are up now — drive Phase-2 notifier replay for any terminal tasks
+  // whose completion/failure payloads were prepared but never delivered
+  // (e.g., if the server restarted mid-task or Telegram was flaky at the
+  // time). Fire-and-forget so the rest of boot doesn't block on the
+  // Telegram round-trips.
+  dispatcher.replayPendingNotifications().catch((err: unknown) => {
+    console.error("[engine] Phase-2 notification replay failed:", err);
+  });
+
+  // Hourly sweep of expired hire proposals. Boot-time pass already fired
+  // inside recoverStuckTasks; this catches anything that expires during a
+  // long-running session (past the 24h TTL) without waiting for the next
+  // restart. Cheap: just an indexed query + conditional UPDATE per hit.
+  const APPROVAL_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+  setInterval(() => {
+    dispatcher.sweepExpiredApprovals().catch((err: unknown) => {
+      console.error("[engine] approval TTL sweep failed:", err);
+    });
+    // Also re-drive Phase-2 delivery in case any newly-expired tasks
+    // prepared payloads — otherwise they'd sit undelivered until the
+    // next server restart.
+    dispatcher.replayPendingNotifications().catch((err: unknown) => {
+      console.error("[engine] approval sweep replay failed:", err);
+    });
+  }, APPROVAL_SWEEP_INTERVAL_MS);
 
   // 11. Start the scheduled task ticker
   const scheduler = new Scheduler({
@@ -409,6 +662,62 @@ async function main() {
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+/**
+ * Persist a system-announcement message into an agent's conversation with a
+ * specific member so the agent's next turn (which resumes the SDK session
+ * with a cached system prompt) has the announcement in history. Prevents
+ * the "X isn't on staff yet" bug where Carson's prompt was built at
+ * session-start, the hire landed during the session, and Carson had no
+ * visibility into the change until the prompt was rebuilt.
+ *
+ * Resilient by design: failure to persist is logged but doesn't block the
+ * Telegram send — the user still got the announcement.
+ */
+async function threadHireAnnouncement(
+  db: ReturnType<typeof createDb>,
+  agentId: string,
+  memberId: string,
+  text: string,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  try {
+    // Conversation key in the runtime is (agentId, memberId, householdId,
+    // channel) — see ConstitutionEngine.getOrCreateConversation. The
+    // next turn that must see this announcement is the resumed Telegram
+    // turn, so scope to channel="telegram" explicitly. Writing to the
+    // wrong conversation row (e.g., a web conversation when the next
+    // turn comes through Telegram) reintroduces the stale-staff-cache
+    // bug we're closing.
+    const [conversation] = await db
+      .select({ id: conversations.id })
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.agentId, agentId),
+          eq(conversations.memberId, memberId),
+          eq(conversations.channel, "telegram"),
+        ),
+      )
+      .orderBy(desc(conversations.lastMessageAt))
+      .limit(1);
+    if (!conversation) return;
+
+    const now = new Date();
+    await db.insert(messages).values({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: text,
+      metadata,
+    });
+    await db
+      .update(conversations)
+      .set({ lastMessageAt: now.toISOString() })
+      .where(eq(conversations.id, conversation.id));
+  } catch (err) {
+    console.warn("[events] threadHireAnnouncement failed:", err);
+  }
 }
 
 main().catch((err) => {

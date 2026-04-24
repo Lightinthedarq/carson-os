@@ -43,12 +43,40 @@ interface Task {
   agentId: string;
   agentName?: string;
   requestedBy?: string;
+  /** Resolved family member name for `requestedBy`. v0.4 server enriches
+   * this on GET /tasks so the UI can show "Requested by Josh" instead of
+   * a raw memberId UUID. */
+  requestedByName?: string;
   governingClauses?: string[];
   result?: string;
   report?: string;
+  description?: string;
   events?: TaskEvent[];
   createdAt: string;
   updatedAt?: string;
+}
+
+interface HireProposalMeta {
+  kind: "hire_proposal";
+  role?: string;
+  specialty?: string;
+  reason?: string;
+  proposedName?: string;
+  customInstructions?: string;
+  model?: string;
+  trustLevel?: "full" | "standard" | "restricted";
+  originalUserRequest?: string;
+}
+
+function parseHireProposal(description: string | undefined): HireProposalMeta | null {
+  if (!description) return null;
+  try {
+    const parsed = JSON.parse(description) as { kind?: string } & HireProposalMeta;
+    if (parsed.kind !== "hire_proposal") return null;
+    return parsed as HireProposalMeta;
+  } catch {
+    return null;
+  }
 }
 
 interface StaffAgent {
@@ -140,7 +168,11 @@ function TaskCard({ task, onSelect }: { task: Task; onSelect: () => void }) {
               </p>
               <p className="text-[11px] mt-0.5" style={{ color: "#8a8070" }}>
                 {task.agentName || "Unknown agent"}
-                {task.requestedBy ? ` \u00B7 Requested by ${task.requestedBy}` : ""}
+                {task.requestedByName
+                  ? ` \u00B7 Requested by ${task.requestedByName}`
+                  : task.requestedBy
+                  ? ` \u00B7 Requested by ${task.requestedBy.slice(0, 8)}…`
+                  : ""}
                 {" \u00B7 "}
                 {relativeTime(task.createdAt)}
               </p>
@@ -183,6 +215,34 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
 
   const approveMutation = useMutation({
     mutationFn: () => api.post(`/tasks/${taskId}/approve`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
+    },
+  });
+
+  // Dedicated mutations for hire_proposal tasks — these route through the
+  // v0.4 DelegationService so the approval actually materializes a staff
+  // agent + delegation edges (the v0.1 taskEngine.approveTask path just
+  // flips the status and doesn't know about hiring).
+  const approveHireMutation = useMutation<
+    { ok: true; developerAgentId?: string; alreadyResolved?: boolean },
+    Error
+  >({
+    mutationFn: () =>
+      api.post(`/tasks/${taskId}/approve-hire`, { approvedBy: "web-ui" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["task", taskId] });
+      queryClient.invalidateQueries({ queryKey: ["staff"] });
+    },
+  });
+  const rejectHireMutation = useMutation<
+    { ok: true; alreadyResolved?: boolean },
+    Error
+  >({
+    mutationFn: () =>
+      api.post(`/tasks/${taskId}/reject-hire`, { rejectedBy: "web-ui" }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       queryClient.invalidateQueries({ queryKey: ["task", taskId] });
@@ -236,7 +296,9 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
         <div className="grid grid-cols-2 gap-3 mb-4 text-xs" style={{ color: "#8a8070" }}>
           <div>
             <span className="text-[10px] uppercase tracking-wider block mb-0.5">Requested by</span>
-            <span style={{ color: "#2c2c2c" }}>{task.requestedBy || "System"}</span>
+            <span style={{ color: "#2c2c2c" }}>
+              {task.requestedByName ?? (task.requestedBy ? `${task.requestedBy.slice(0, 8)}…` : "System")}
+            </span>
           </div>
           <div>
             <span className="text-[10px] uppercase tracking-wider block mb-0.5">Created</span>
@@ -329,20 +391,99 @@ function TaskDetail({ taskId, onClose }: { taskId: string; onClose: () => void }
           </div>
         )}
 
-        {/* Approve action */}
-        {task.status === "pending" && (
-          <div className="flex gap-2 pt-3 border-t" style={{ borderColor: "#eee8dd" }}>
-            <Button
-              size="sm"
-              onClick={() => approveMutation.mutate()}
-              disabled={approveMutation.isPending}
-              style={{ background: "#2e7d32", color: "#fff" }}
-            >
-              <ThumbsUp className="h-3.5 w-3.5 mr-1" />
-              {approveMutation.isPending ? "Approving..." : "Approve"}
-            </Button>
-          </div>
-        )}
+        {/* Approve action — hire proposals route through the v0.4 flow;
+            everything else uses the v0.1 taskEngine approve path. */}
+        {task.status === "pending" && (() => {
+          const hire = parseHireProposal(task.description);
+          if (hire) {
+            const errMsg =
+              (approveHireMutation.error?.message) ||
+              (rejectHireMutation.error?.message);
+            return (
+              <div className="pt-3 border-t" style={{ borderColor: "#eee8dd" }}>
+                <div
+                  className="mb-3 p-3 rounded text-xs"
+                  style={{ background: "#faf6ed", color: "#5a4a2e" }}
+                >
+                  <div className="font-semibold mb-1" style={{ color: "#1a1f2e" }}>
+                    Hire: {hire.proposedName ?? "a new specialist"}
+                    {hire.role ? ` — ${hire.role}` : ""}
+                  </div>
+                  <div className="mb-1">
+                    <span className="uppercase tracking-wider text-[10px]" style={{ color: "#8a8070" }}>Specialty</span>{" "}
+                    <code>{hire.specialty ?? "general"}</code>
+                  </div>
+                  {hire.reason && (
+                    <div className="mb-1">
+                      <span className="uppercase tracking-wider text-[10px]" style={{ color: "#8a8070" }}>Reason</span>{" "}
+                      {hire.reason}
+                    </div>
+                  )}
+                  {hire.customInstructions && (
+                    <div className="mb-1">
+                      <span className="uppercase tracking-wider text-[10px]" style={{ color: "#8a8070" }}>Custom operating instructions</span>
+                      <pre
+                        className="mt-1 p-2 text-[11px] whitespace-pre-wrap rounded"
+                        style={{ background: "#fff", border: "1px solid #e0d9c7", maxHeight: "12rem", overflowY: "auto" }}
+                      >
+                        {hire.customInstructions}
+                      </pre>
+                    </div>
+                  )}
+                  {hire.originalUserRequest && (
+                    <div className="mb-1">
+                      <span className="uppercase tracking-wider text-[10px]" style={{ color: "#8a8070" }}>Will auto-delegate</span>{" "}
+                      <i>{hire.originalUserRequest}</i>
+                    </div>
+                  )}
+                  <div>
+                    <span className="uppercase tracking-wider text-[10px]" style={{ color: "#8a8070" }}>Model / trust</span>{" "}
+                    {hire.model ?? "default"}, {hire.trustLevel ?? "default"}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => approveHireMutation.mutate()}
+                    disabled={approveHireMutation.isPending || rejectHireMutation.isPending}
+                    style={{ background: "#2e7d32", color: "#fff" }}
+                  >
+                    <ThumbsUp className="h-3.5 w-3.5 mr-1" />
+                    {approveHireMutation.isPending ? "Approving..." : "Approve hire"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => rejectHireMutation.mutate()}
+                    disabled={approveHireMutation.isPending || rejectHireMutation.isPending}
+                  >
+                    <XCircle className="h-3.5 w-3.5 mr-1" />
+                    {rejectHireMutation.isPending ? "Rejecting..." : "Reject"}
+                  </Button>
+                </div>
+                {errMsg && (
+                  <p className="text-xs mt-2" style={{ color: "#a82020" }}>
+                    {errMsg}
+                  </p>
+                )}
+              </div>
+            );
+          }
+          // Non-hire pending task — original behavior.
+          return (
+            <div className="flex gap-2 pt-3 border-t" style={{ borderColor: "#eee8dd" }}>
+              <Button
+                size="sm"
+                onClick={() => approveMutation.mutate()}
+                disabled={approveMutation.isPending}
+                style={{ background: "#2e7d32", color: "#fff" }}
+              >
+                <ThumbsUp className="h-3.5 w-3.5 mr-1" />
+                {approveMutation.isPending ? "Approving..." : "Approve"}
+              </Button>
+            </div>
+          );
+        })()}
       </CardContent>
     </Card>
   );

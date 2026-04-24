@@ -41,16 +41,15 @@
 
 import { EventEmitter } from "node:events";
 import http from "node:http";
-import { eq, and, or, desc } from "drizzle-orm";
+import { eq, and, or } from "drizzle-orm";
 import type { Db } from "@carsonos/db";
 import {
   staffAgents,
   staffAssignments,
   familyMembers,
-  conversations,
 } from "@carsonos/db";
 import type { ConstitutionEngine } from "./constitution-engine.js";
-import type { DelegationOrchestrator } from "./delegation-orchestrator.js";
+import type { DelegationService } from "./delegation-service.js";
 import { createSignalStream, markdownToSignalText, chunkSignalMessage } from "./signal-streaming.js";
 import { stripThinkingBlocks } from "./telegram-format.js";
 
@@ -59,7 +58,7 @@ import { stripThinkingBlocks } from "./telegram-format.js";
 export interface SignalRelayConfig {
   db: Db;
   engine: ConstitutionEngine;
-  orchestrator: DelegationOrchestrator;
+  orchestrator: DelegationService;
 }
 
 /** A staff agent row augmented with Signal-specific columns. */
@@ -221,7 +220,7 @@ class RateLimiter {
 export class SignalRelayManager {
   private db: Db;
   private engine: ConstitutionEngine;
-  private orchestrator: DelegationOrchestrator;
+  private orchestrator: DelegationService;
 
   private accounts = new Map<string, ManagedAccount>();
   private rateLimiter = new RateLimiter();
@@ -724,32 +723,10 @@ export class SignalRelayManager {
       return;
     }
 
-    // Run through delegation orchestrator
-    const conversationId = await this.getOrCreateConversationId(
-      agentId,
-      member.id,
-      member.householdId,
-    );
-
-    const delegationResult = await this.orchestrator.handleAgentResponse(
-      agentId,
-      member.id,
-      member.householdId,
-      conversationId,
-      engineResult.response,
-    );
-
-    if (delegationResult.warnings?.length) {
-      for (const w of delegationResult.warnings) {
-        console.warn(`[signal-relay:${managed.agentName}] Delegation warning: ${w}`);
-      }
-    }
-
-    // If delegated, the engine response already went out via stream.finish().
-    // Send the delegation acknowledgement if the orchestrator produced one.
-    if (delegationResult.delegated && delegationResult.userMessage) {
-      await this.sendFormatted(daemonPort, senderNumber, delegationResult.userMessage);
-    }
+    // v0.4: delegation happens during the agent's turn via MCP tool calls
+    // (delegate_task etc.), not as a post-processing XML-parse step. The
+    // engine response is already streamed to the user above; nothing more
+    // to do here.
   }
 
   // ── Sending ─────────────────────────────────────────────────────────
@@ -911,47 +888,4 @@ export class SignalRelayManager {
     }
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────────
-
-  private async getOrCreateConversationId(
-    agentId: string,
-    memberId: string,
-    householdId: string,
-  ): Promise<string> {
-    const today = new Date().toISOString().slice(0, 10);
-
-    const existing = await this.db
-      .select()
-      .from(conversations)
-      .where(
-        and(
-          eq(conversations.agentId, agentId),
-          eq(conversations.memberId, memberId),
-          eq(conversations.householdId, householdId),
-          eq(conversations.channel, "signal"),
-        ),
-      )
-      .orderBy(desc(conversations.startedAt))
-      .limit(1)
-      .then((rows) => rows[0]);
-
-    if (existing?.startedAt.startsWith(today)) {
-      return existing.id;
-    }
-
-    const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-
-    await this.db.insert(conversations).values({
-      id,
-      agentId,
-      memberId,
-      householdId,
-      channel: "signal",
-      startedAt: now,
-      lastMessageAt: now,
-    });
-
-    return id;
-  }
 }

@@ -7,29 +7,43 @@
  */
 
 import { Router } from "express";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, or, desc, inArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import type { Db } from "@carsonos/db";
 import {
   staffAgents,
   staffAssignments,
   familyMembers,
   conversations,
+  messages,
+  tasks,
+  taskEvents,
+  policyEvents,
   delegationEdges,
+  delegationNotifications,
+  activityLog,
+  toolGrants,
+  scheduledTasks,
+  customTools,
   personalityInterviewState,
 } from "@carsonos/db";
 import type { PersonalityInterviewEngine } from "../services/personality-interview.js";
 import type { MultiRelayManager } from "../services/multi-relay-manager.js";
 import type { SignalRelayManager } from "../services/signal-relay-manager.js";
+import type { DelegationService } from "../services/delegation-service.js";
 
 export interface StaffRouteDeps {
   db: Db;
   personalityInterviewEngine: PersonalityInterviewEngine;
   multiRelay?: MultiRelayManager;
   signalRelay?: SignalRelayManager;
+  /** Used by the delegation-edges endpoints to apply topology validation
+   * (personal → specialist, no self-grants, no personal→personal). */
+  delegationService?: DelegationService;
 }
 
 export function createStaffRoutes(deps: StaffRouteDeps): Router {
-  const { db, personalityInterviewEngine, multiRelay, signalRelay } = deps;
+  const { db, personalityInterviewEngine, multiRelay, signalRelay, delegationService } = deps;
   const router = Router();
 
   // GET / -- list all staff agents (scoped to household)
@@ -263,12 +277,164 @@ export function createStaffRoutes(deps: StaffRouteDeps): Router {
     res.json({ agent: updated });
   });
 
-  // DELETE /:id -- delete staff agent (block if Chief of Staff)
-  router.delete("/:id", async (req, res) => {
-    const existing = await db
+  // GET /:id/delegation-edges — who can delegate to this agent (incoming)
+  // and who this agent can delegate to (outgoing). Used by the StaffDetail
+  // page to render the N:M grant UI introduced in v0.4.
+  router.get("/:id/delegation-edges", async (req, res) => {
+    const agentId = req.params.id;
+
+    const agent = db
+      .select()
+      .from(staffAgents)
+      .where(eq(staffAgents.id, agentId))
+      .get();
+    if (!agent) {
+      res.status(404).json({ error: "Staff agent not found" });
+      return;
+    }
+
+    const sFrom = alias(staffAgents, "sa_from");
+    const sTo = alias(staffAgents, "sa_to");
+
+    const incoming = await db
+      .select({
+        edgeId: delegationEdges.id,
+        agentId: sFrom.id,
+        agentName: sFrom.name,
+        agentRole: sFrom.staffRole,
+        isHeadButler: sFrom.isHeadButler,
+      })
+      .from(delegationEdges)
+      .innerJoin(sFrom, eq(sFrom.id, delegationEdges.fromAgentId))
+      .where(eq(delegationEdges.toAgentId, agentId))
+      .all();
+
+    const outgoing = await db
+      .select({
+        edgeId: delegationEdges.id,
+        agentId: sTo.id,
+        agentName: sTo.name,
+        agentRole: sTo.staffRole,
+        isHeadButler: sTo.isHeadButler,
+      })
+      .from(delegationEdges)
+      .innerJoin(sTo, eq(sTo.id, delegationEdges.toAgentId))
+      .where(eq(delegationEdges.fromAgentId, agentId))
+      .all();
+
+    // Candidate lists power the UI's "add a grant" pickers. Scoped to the
+    // same household and filtered to the topology the service enforces.
+    const candidates = await db
+      .select({
+        id: staffAgents.id,
+        name: staffAgents.name,
+        staffRole: staffAgents.staffRole,
+        specialty: staffAgents.specialty,
+        isHeadButler: staffAgents.isHeadButler,
+      })
+      .from(staffAgents)
+      .where(
+        and(
+          eq(staffAgents.householdId, agent.householdId),
+          eq(staffAgents.status, "active"),
+        ),
+      )
+      .all();
+
+    const isPersonalAgent = (a: (typeof candidates)[number]) =>
+      a.staffRole === "personal" || a.staffRole === "head_butler" || a.isHeadButler;
+
+    const agentIsPersonal = agent.staffRole === "personal" || agent.staffRole === "head_butler" || agent.isHeadButler;
+
+    const incomingCandidates = candidates.filter(
+      (a) => a.id !== agent.id && isPersonalAgent(a),
+    );
+    const outgoingCandidates = candidates.filter(
+      (a) => a.id !== agent.id && !isPersonalAgent(a),
+    );
+
+    res.json({
+      agent: { id: agent.id, name: agent.name, staffRole: agent.staffRole, isPersonalAgent: agentIsPersonal },
+      incoming,
+      outgoing,
+      incomingCandidates: agentIsPersonal ? [] : incomingCandidates,
+      outgoingCandidates: agentIsPersonal ? outgoingCandidates : [],
+    });
+  });
+
+  // POST /:id/delegation-edges/incoming — grant a delegator access to this
+  // specialist. Body: { delegatorId }. Returns { created }.
+  router.post("/:id/delegation-edges/incoming", async (req, res) => {
+    if (!delegationService) {
+      res.status(503).json({ error: "delegation service unavailable" });
+      return;
+    }
+    const { delegatorId } = req.body as { delegatorId?: string };
+    if (!delegatorId) {
+      res.status(400).json({ error: "delegatorId required" });
+      return;
+    }
+    const specialist = db
       .select()
       .from(staffAgents)
       .where(eq(staffAgents.id, req.params.id))
+      .get();
+    if (!specialist) {
+      res.status(404).json({ error: "Specialist not found" });
+      return;
+    }
+    const result = await delegationService.handleGrantDelegation({
+      householdId: specialist.householdId,
+      delegatorId,
+      specialistId: specialist.id,
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error, code: result.code });
+      return;
+    }
+    res.json({ created: result.created });
+  });
+
+  // DELETE /:id/delegation-edges/incoming/:delegatorId — revoke a grant.
+  router.delete("/:id/delegation-edges/incoming/:delegatorId", async (req, res) => {
+    if (!delegationService) {
+      res.status(503).json({ error: "delegation service unavailable" });
+      return;
+    }
+    const specialist = db
+      .select()
+      .from(staffAgents)
+      .where(eq(staffAgents.id, req.params.id))
+      .get();
+    if (!specialist) {
+      res.status(404).json({ error: "Specialist not found" });
+      return;
+    }
+    const result = await delegationService.handleRevokeDelegation({
+      householdId: specialist.householdId,
+      delegatorId: req.params.delegatorId,
+      specialistId: specialist.id,
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error, code: result.code });
+      return;
+    }
+    res.json({ removed: result.removed });
+  });
+
+  // DELETE /:id -- delete staff agent.
+  //
+  // FK cleanup: staff_agents.id is referenced by 10 tables, most NOT NULL, and
+  // the Drizzle better-sqlite3 driver enables PRAGMA foreign_keys=ON, so a
+  // naive DELETE fails. We block when state would be unsafe to discard (active
+  // tasks, live custom tools) and cascade the rest in a single transaction.
+  router.delete("/:id", async (req, res) => {
+    const agentId = req.params.id;
+
+    const existing = await db
+      .select()
+      .from(staffAgents)
+      .where(eq(staffAgents.id, agentId))
       .get();
 
     if (!existing) {
@@ -281,13 +447,136 @@ export function createStaffRoutes(deps: StaffRouteDeps): Router {
       return;
     }
 
-    // Delete assignments first (FK constraint)
-    await db
-      .delete(staffAssignments)
-      .where(eq(staffAssignments.agentId, req.params.id));
+    // Block if this agent has active tasks. Deleting mid-run would leave a
+    // worktree/sandbox orphaned and a reconciler writing into a vanished
+    // agent row. Ask the user to cancel the task(s) first.
+    const activeTasks = await db
+      .select({ id: tasks.id, title: tasks.title, status: tasks.status })
+      .from(tasks)
+      .where(
+        and(
+          eq(tasks.agentId, agentId),
+          inArray(tasks.status, ["pending", "approved", "in_progress"]),
+        ),
+      );
+    if (activeTasks.length > 0) {
+      res.status(409).json({
+        error: `agent has ${activeTasks.length} active task(s). Cancel them first: ${activeTasks
+          .map((t) => `"${t.title}" (${t.status})`)
+          .join(", ")}`,
+      });
+      return;
+    }
 
-    // Delete agent
-    await db.delete(staffAgents).where(eq(staffAgents.id, req.params.id));
+    // Block if this agent authored custom tools that are live. Hired Devs
+    // often build tools; losing those tools on delete is a surprise. Tell
+    // the user to delete or reassign the tools first.
+    const liveTools = await db
+      .select({ id: customTools.id, name: customTools.name, status: customTools.status })
+      .from(customTools)
+      .where(
+        and(
+          eq(customTools.createdByAgentId, agentId),
+          inArray(customTools.status, ["active", "pending_approval"]),
+        ),
+      );
+    if (liveTools.length > 0) {
+      res.status(409).json({
+        error: `agent authored ${liveTools.length} live custom tool(s). Delete them first in Tools: ${liveTools
+          .map((t) => t.name)
+          .join(", ")}`,
+      });
+      return;
+    }
+
+    // better-sqlite3 is synchronous; Drizzle's transaction wrapper rejects
+    // async callbacks. Run each Drizzle chain sync with .all()/.run()/.get().
+    try {
+      db.transaction((tx) => {
+        // Conversations + their messages. messages references conversations(id),
+        // so messages must go first.
+        const agentConvs = tx
+          .select({ id: conversations.id })
+          .from(conversations)
+          .where(eq(conversations.agentId, agentId))
+          .all();
+        const convIds = agentConvs.map((c) => c.id);
+        if (convIds.length > 0) {
+          tx.delete(messages).where(inArray(messages.conversationId, convIds)).run();
+          tx.delete(conversations).where(inArray(conversations.id, convIds)).run();
+        }
+
+        // Task graveyard: clear everything that references the agent's tasks
+        // before deleting the tasks themselves. tasks.id is referenced by
+        // task_events AND delegation_notifications — both NOT NULL, both need
+        // to go first or the parent delete trips SQLITE_CONSTRAINT_FOREIGNKEY.
+        // task_events.agent_id and policy_events.agent_id reference the agent
+        // directly too, so clear those independent of task-scoped deletes.
+        const agentTasks = tx
+          .select({ id: tasks.id })
+          .from(tasks)
+          .where(eq(tasks.agentId, agentId))
+          .all();
+        const taskIds = agentTasks.map((t) => t.id);
+        if (taskIds.length > 0) {
+          tx.delete(taskEvents).where(inArray(taskEvents.taskId, taskIds)).run();
+          tx
+            .delete(delegationNotifications)
+            .where(inArray(delegationNotifications.taskId, taskIds))
+            .run();
+        }
+        tx.delete(taskEvents).where(eq(taskEvents.agentId, agentId)).run();
+        tx.delete(policyEvents).where(eq(policyEvents.agentId, agentId)).run();
+        tx
+          .update(tasks)
+          .set({ notifyAgentId: null })
+          .where(eq(tasks.notifyAgentId, agentId))
+          .run();
+        if (taskIds.length > 0) {
+          tx.delete(tasks).where(inArray(tasks.id, taskIds)).run();
+        }
+
+        // activity_log.agent_id is nullable but FK-enforced. Null it out
+        // instead of deleting so the household's audit trail survives.
+        tx
+          .update(activityLog)
+          .set({ agentId: null })
+          .where(eq(activityLog.agentId, agentId))
+          .run();
+
+        // Per-agent registries: tool grants, scheduled jobs, delegation edges,
+        // assignments, personality-interview state. All scoped to this agent.
+        tx.delete(toolGrants).where(eq(toolGrants.agentId, agentId)).run();
+        tx.delete(scheduledTasks).where(eq(scheduledTasks.agentId, agentId)).run();
+        tx
+          .delete(delegationEdges)
+          .where(
+            or(
+              eq(delegationEdges.fromAgentId, agentId),
+              eq(delegationEdges.toAgentId, agentId),
+            ),
+          )
+          .run();
+        tx.delete(staffAssignments).where(eq(staffAssignments.agentId, agentId)).run();
+        tx
+          .delete(personalityInterviewState)
+          .where(eq(personalityInterviewState.agentId, agentId))
+          .run();
+
+        // Boot-time seed marker — otherwise seedMissingDefaults might skip a
+        // fresh re-hire because a stale `grants_seeded:<id>` row exists.
+        tx.run(
+          sql`DELETE FROM instance_settings WHERE key = ${`grants_seeded:${agentId}`}`,
+        );
+
+        tx.delete(staffAgents).where(eq(staffAgents.id, agentId)).run();
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[staff] DELETE /${agentId} failed:`, err);
+      res.status(500).json({ error: `failed to delete staff agent: ${msg}` });
+      return;
+    }
 
     res.json({ deleted: true });
   });
@@ -452,6 +741,13 @@ export function createStaffRoutes(deps: StaffRouteDeps): Router {
   // -- Delegation Edges -----------------------------------------------
 
   // GET /:id/delegations -- list delegation edges from this agent
+  // Legacy outgoing-edges shape kept for backward compat with the existing
+  // StaffDetail UI. The mutating POST/DELETE paths below now go through the
+  // DelegationService so the same topology rules apply (personal → specialist,
+  // no personal→personal, no self-grants). The read GET path still queries
+  // directly — read has no trust-boundary risk. The pre-v0.4 inline
+  // insert/delete variant of this endpoint let kids grant themselves access
+  // to anything, which is what we just closed.
   router.get("/:id/delegations", async (req, res) => {
     const edges = await db
       .select({
@@ -472,67 +768,55 @@ export function createStaffRoutes(deps: StaffRouteDeps): Router {
     res.json({ delegations: edges });
   });
 
-  // POST /:id/delegations -- add delegation edge
   router.post("/:id/delegations", async (req, res) => {
-    const { toAgentId, allowedTaskTypes, relayProgress } = req.body;
+    if (!delegationService) {
+      res.status(503).json({ error: "delegation service unavailable" });
+      return;
+    }
+    const { toAgentId } = req.body as { toAgentId?: string };
     const fromAgentId = req.params.id;
-
     if (!toAgentId) {
       res.status(400).json({ error: "toAgentId is required" });
       return;
     }
-
-    // Verify both agents exist
-    const fromAgent = await db.select().from(staffAgents).where(eq(staffAgents.id, fromAgentId)).get();
-    const toAgent = await db.select().from(staffAgents).where(eq(staffAgents.id, toAgentId)).get();
-
-    if (!fromAgent) { res.status(404).json({ error: "Source agent not found" }); return; }
-    if (!toAgent) { res.status(404).json({ error: "Target agent not found" }); return; }
-
-    try {
-      const [edge] = await db
-        .insert(delegationEdges)
-        .values({
-          fromAgentId,
-          toAgentId,
-          allowedTaskTypes: allowedTaskTypes ?? null,
-          relayProgress: relayProgress ?? false,
-        })
-        .returning();
-
-      res.status(201).json({ delegation: edge });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed";
-      if (message.includes("UNIQUE") || message.includes("unique")) {
-        res.status(409).json({ error: "Delegation edge already exists" });
-        return;
-      }
-      throw err;
-    }
-  });
-
-  // DELETE /:fromId/delegations/:toId -- remove delegation edge
-  router.delete("/:fromId/delegations/:toId", async (req, res) => {
-    const { fromId, toId } = req.params;
-
-    const existing = await db
-      .select()
-      .from(delegationEdges)
-      .where(
-        and(
-          eq(delegationEdges.fromAgentId, fromId),
-          eq(delegationEdges.toAgentId, toId),
-        ),
-      )
-      .get();
-
-    if (!existing) {
-      res.status(404).json({ error: "Delegation edge not found" });
+    const fromAgent = db.select().from(staffAgents).where(eq(staffAgents.id, fromAgentId)).get();
+    if (!fromAgent) {
+      res.status(404).json({ error: "Source agent not found" });
       return;
     }
+    const result = await delegationService.handleGrantDelegation({
+      householdId: fromAgent.householdId,
+      delegatorId: fromAgentId,
+      specialistId: toAgentId,
+    });
+    if (!result.ok) {
+      const status = result.code === "E_AGENT_NOT_FOUND" ? 404 : 400;
+      res.status(status).json({ error: result.error, code: result.code });
+      return;
+    }
+    res.status(result.created ? 201 : 200).json({ created: result.created });
+  });
 
-    await db.delete(delegationEdges).where(eq(delegationEdges.id, existing.id));
-    res.json({ deleted: true });
+  router.delete("/:fromId/delegations/:toId", async (req, res) => {
+    if (!delegationService) {
+      res.status(503).json({ error: "delegation service unavailable" });
+      return;
+    }
+    const fromAgent = db.select().from(staffAgents).where(eq(staffAgents.id, req.params.fromId)).get();
+    if (!fromAgent) {
+      res.status(404).json({ error: "Source agent not found" });
+      return;
+    }
+    const result = await delegationService.handleRevokeDelegation({
+      householdId: fromAgent.householdId,
+      delegatorId: req.params.fromId,
+      specialistId: req.params.toId,
+    });
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json({ deleted: result.removed });
   });
 
   return router;
