@@ -295,6 +295,51 @@ The actual plan body.
     expect(result.body).not.toContain("```");
   });
 
+  it("tolerates narration plus markdown horizontal rule before fenced frontmatter", () => {
+    // Pattern 3 from the parser's tolerance NOTE — observed in three smoke-
+    // test runs (2026-04-26): the Planner emits narration, then a standalone
+    // '---' (markdown horizontal rule), then a fenced yaml block whose own
+    // '---' delimiters carry the real frontmatter.
+    const body = [
+      "I'll read the codebase first.",
+      "Now let me check the memory tools.",
+      "I have a complete picture. Producing the plan now.",
+      "",
+      "---",
+      "",
+      "```yaml",
+      "---",
+      "plan_state: complete",
+      "target_developer: project",
+      'foundational_invariant: "x"',
+      'state_location: "y"',
+      "failure_modes_considered: []",
+      "prior_plans_consulted: []",
+      "decisions_referenced: []",
+      "estimated_complexity: large",
+      "out_of_scope: []",
+      "open_questions: []",
+      "---",
+      "```",
+      "",
+      "## Interpretation",
+      "",
+      "The plan body content here.",
+    ].join("\n");
+
+    const result = parsePlanResult(body);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    if (result.frontmatter.plan_state === "complete") {
+      expect(result.frontmatter.target_developer).toBe("project");
+      expect(result.frontmatter.estimated_complexity).toBe("large");
+    }
+    expect(result.body).toContain("## Interpretation");
+    expect(result.body).toContain("The plan body content here");
+    expect(result.body).not.toContain("```");
+    expect(result.body).not.toContain("I'll read the codebase");
+  });
+
   it("still rejects input with no frontmatter delimiter at all", () => {
     const body = `# Just markdown
 
