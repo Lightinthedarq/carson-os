@@ -20,3 +20,6 @@ dist/
 
 # Local test/smoke-test scripts
 scripts/test-*.ts
+
+# Marketing/launch video project (Remotion, separate scope from server/ui)
+marketing/
