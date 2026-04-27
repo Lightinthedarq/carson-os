@@ -45,7 +45,8 @@ interface Conversation {
   memberName: string;
   channel: string;
   lastMessage: string | null;
-  lastMessageAt: string;
+  lastMessageAt: string | null;
+  startedAt: string;
   messageCount: number;
 }
 
@@ -142,7 +143,7 @@ function ConversationRow({
           </span>
         </div>
         <span className="text-[10px] shrink-0" style={{ color: "#a09080" }}>
-          {relativeTime(conversation.lastMessageAt)}
+          {relativeTime(conversation.lastMessageAt ?? conversation.startedAt)}
         </span>
       </div>
       <p className="text-xs truncate pl-9" style={{ color: "#8a8070" }}>
